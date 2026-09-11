@@ -46,6 +46,25 @@ What it does
        calibrated = (raw - master_bias - dark_rate*EXPTIME) / master_flat
    (the flat-division step is skipped if no flat was built) -- done as
    full-frame 2D arrays.
+4.5. Detects a FIXED bad-pixel pattern across the calibrated science frames
+   and masks it to NaN, in every frame, before alignment. This exists for
+   defects that are baked into the detector itself (a flaky/trap pixel, a
+   small hot cluster) and therefore show up identically in every science
+   frame: if the frames aren't dithered (or barely are), such a defect looks
+   exactly like a real, consistent source to the sigma-clipped combine in
+   step 6 below, since that step can only reject a pixel that's an outlier
+   RELATIVE TO THE OTHER FRAMES at that location -- it survives straight
+   into the final stack otherwise. This step catches it differently: it runs
+   LACosmic (via the `astroscrappy` package) independently on each raw
+   calibrated frame -- before any resampling, so LACosmic's assumption of
+   independent per-pixel noise actually holds -- and flags pixels by SHAPE
+   (sharp/blocky, unlike a real star's smooth PSF falloff) rather than by
+   amplitude or cross-frame consistency, so it catches the defect even
+   though every single frame has it identically. The union of what's
+   flagged across all frames (dilated by a couple of pixels to cover any
+   sub-pixel drift introduced by alignment) is masked to NaN in every
+   calibrated frame. Skip with --no-bad-pixel-mask; skipped automatically
+   (with a warning) if `astroscrappy` isn't installed.
 5. Aligns the calibrated science frames to a reference frame using
    star-pattern matching (astroalign), to correct for any drift between
    exposures.
@@ -56,7 +75,10 @@ Caveat: if you have only one or two dark (or flat) frames, there's very
 little ability to sigma-clip out a cosmic ray or hot pixel landing in one of
 them -- it can leave a fixed artifact at that pixel in every calibrated
 science frame. Worth a visual sanity check of the dark-rate/master-flat
-outputs if you notice odd fixed-position defects in the stack.
+outputs if you notice odd fixed-position defects in the stack. (Step 4.5
+above catches this specific case too, as long as it's consistently visible
+under sky-level illumination in the science frames themselves -- it doesn't
+need the defect to be visible in the bias/dark/flat.)
 
 Usage
 -----
@@ -65,7 +87,9 @@ Usage
         [--flat-root flat_u] [--no-flat-fielding] \\
         [--output-dir /path/to/output] \\
         [--output-bias NAME] [--output-dark NAME] [--output-flat NAME] \\
-        [--output-stack NAME] [--save-calibrated-frames]
+        [--output-stack NAME] [--save-calibrated-frames] \\
+        [--no-bad-pixel-mask] [--gain GAIN] [--readnoise ADU] \\
+        [--bpm-sigclip SIGMA] [--bpm-dilate N]
 
 Root names are matched as "<root>*.fits" under --data-dir. Run with -h for
 the full list of options and their defaults.
@@ -73,6 +97,9 @@ the full list of options and their defaults.
 Requires: astropy, numpy, scipy. astroalign is optional but recommended
 (pip install astroalign) for sub-pixel-accurate registration; without it,
 the script falls back to integer-pixel shift alignment via cross-correlation.
+astroscrappy is also optional but recommended (pip install astroscrappy) for
+the fixed-bad-pixel-mask step described above; without it, that step is
+skipped with a warning.
 """
 
 import argparse
@@ -84,6 +111,7 @@ import warnings
 import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clip, sigma_clipped_stats
+from scipy.ndimage import binary_dilation
 from scipy.signal import fftconvolve   # needed by the alignment fallback below,
                                         # which can trigger even when astroalign
                                         # IS installed (e.g. on a MaxIterError)
@@ -93,6 +121,12 @@ try:
     HAVE_ASTROALIGN = True
 except ImportError:
     HAVE_ASTROALIGN = False
+
+try:
+    import astroscrappy
+    HAVE_ASTROSCRAPPY = True
+except ImportError:
+    HAVE_ASTROSCRAPPY = False
 
 # Below what fraction of the flat's own median a pixel is treated as
 # unreliable (vignetted/dead) and masked out (set to NaN) rather than
@@ -140,7 +174,38 @@ def parse_args():
                     help="Output stacked science filename "
                          "(default: <science-root>_stack.fits)")
     p.add_argument("--save-calibrated-frames", action="store_true",
-                    help="Also write out each individual calibrated science frame")
+                    help="Also write out each individual calibrated science frame "
+                         "(post bad-pixel-masking, pre-alignment, if that step ran)")
+    p.add_argument("--no-bad-pixel-mask", action="store_true",
+                    help="Skip automatic detection/masking of a fixed bad-pixel pattern "
+                         "across the science frames (see step 4.5 in the module "
+                         "docstring). On by default when astroscrappy is installed AND "
+                         "flat-fielding is being used (see --force-bad-pixel-mask "
+                         "otherwise).")
+    p.add_argument("--force-bad-pixel-mask", action="store_true",
+                    help="Run bad-pixel-mask detection even when no flat-fielding was "
+                         "applied. NOT recommended: LACosmic assumes flat-fielded input, "
+                         "and without a flat, ordinary pixel-to-pixel QE variation reads "
+                         "as defects and can flag a large fraction of the frame. Even "
+                         "with this set, the mask is only applied if the flagged fraction "
+                         "comes out small (see the 1% sanity check in main()) -- "
+                         "otherwise it's reported but skipped.")
+    p.add_argument("--gain", type=float, default=None,
+                    help="Detector gain (e-/ADU), used only for bad-pixel-mask "
+                         "detection. Default: read from the GAIN header keyword if "
+                         "present, else 1.0.")
+    p.add_argument("--readnoise", type=float, default=None,
+                    help="Detector read noise (ADU), used only for bad-pixel-mask "
+                         "detection. Default: read from the RDNOISE header keyword if "
+                         "present, else 15.0.")
+    p.add_argument("--bpm-sigclip", type=float, default=4.5,
+                    help="LACosmic detection threshold (in sigma) for the bad-pixel "
+                         "mask; raise it if real stars get flagged, lower it if a "
+                         "known defect isn't being caught.")
+    p.add_argument("--bpm-dilate", type=int, default=2,
+                    help="Number of binary-dilation iterations applied to the "
+                         "bad-pixel mask, to also cover a few pixels of sub-pixel "
+                         "drift introduced by the alignment step that follows.")
     return p.parse_args()
 
 
@@ -199,12 +264,19 @@ def overscan_correct(data, header, overscan_stat=np.median, label=""):
     """
     layout = get_quadrant_layout(header)
     if not layout:
+        print(f"{label}: no DSECxx keywords found -- not quad-readout data, "
+              "using frame as-is (no overscan correction applied).")
         return data
 
     if len(layout) != 4:
-        warnings.warn(f"{label}: found {len(layout)}/4 quadrant DSECxx keywords "
-                       "-- expected all 4 for quad-readout data. Skipping "
-                       "overscan correction for this frame.")
+        msg = (f"{label}: found {len(layout)}/4 quadrant DSECxx keywords "
+               "-- expected all 4 for quad-readout data. Skipping "
+               "overscan correction for this frame (using it uncorrected, "
+               "full raw overscan/gap counts included).")
+        warnings.warn(msg)
+        print(f"WARNING: {msg}")  # also on stdout: warnings.warn() goes to
+                                   # stderr and is easy to miss/lose when
+                                   # only stdout is captured or redirected
         return data
 
     ny, nx = data.shape
@@ -355,9 +427,17 @@ def build_master_flat(flat_files, master_bias, dark_rate):
             warnings.warn(f"{f}: no EXPTIME in header; skipping this flat frame.")
             continue
         corrected = data - master_bias - dark_rate * exptime
-        med = np.median(corrected)
-        if med <= 0:
-            warnings.warn(f"{f}: non-positive median ({med:.2f}) after bias/dark "
+        # NaN-safe: `corrected` legitimately contains NaN wherever load_data's
+        # overscan_correct masked out overscan/gap columns (real for any
+        # quad-readout ARCTIC frame). A plain np.median poisons to NaN the
+        # instant ANY pixel is NaN, which both silently defeats the `med <= 0`
+        # sanity check below (NaN <= 0 is False, so it looks "fine") and
+        # would make the whole normalized frame NaN -- and from there, the
+        # whole master flat, and every flat-fielded science frame. Use
+        # np.nanmedian so only the real (non-gap) pixels count.
+        med = np.nanmedian(corrected)
+        if not np.isfinite(med) or med <= 0:
+            warnings.warn(f"{f}: non-finite/non-positive median ({med}) after bias/dark "
                            "subtraction; skipping this flat frame.")
             continue
         normalized.append(corrected / med)
@@ -368,7 +448,11 @@ def build_master_flat(flat_files, master_bias, dark_rate):
     stack = np.stack(normalized, axis=0)
     clipped = sigma_clip(stack, sigma=3, maxiters=5, axis=0, masked=True)
     master_flat = np.ma.median(clipped, axis=0).filled(np.nanmedian(stack, axis=0))
-    master_flat = (master_flat / np.median(master_flat)).astype(np.float32)
+    # Same NaN-safety issue as above: overscan/gap pixels are still
+    # (correctly) NaN in master_flat at this point, so this renormalization
+    # must ignore them via nanmedian too, or the ENTIRE master flat -- not
+    # just the gap pixels -- goes NaN.
+    master_flat = (master_flat / np.nanmedian(master_flat)).astype(np.float32)
 
     bad = master_flat < FLAT_MIN_RELATIVE_VALUE
     if np.any(bad):
@@ -379,6 +463,70 @@ def build_master_flat(flat_files, master_bias, dark_rate):
     mean, med, std = sigma_clipped_stats(master_flat, sigma=3, maxiters=5)
     print(f"  master flat stats: mean={mean:.3f}  median={med:.3f}  std={std:.3f}")
     return master_flat, flat_hdr
+
+
+def get_gain_readnoise(header, gain_arg, readnoise_arg):
+    """Resolve gain/readnoise for bad-pixel-mask detection: an explicit CLI
+    value wins, then the header's GAIN/RDNOISE keyword, then a hardcoded
+    fallback (1.0 e-/ADU, 15.0 ADU) if neither is available."""
+    gain = gain_arg if gain_arg is not None else header.get("GAIN", 1.0)
+    readnoise = readnoise_arg if readnoise_arg is not None else header.get("RDNOISE", 15.0)
+    return float(gain), float(readnoise)
+
+
+def build_bad_pixel_mask(calibrated_frames, header, gain_arg, readnoise_arg,
+                          sigclip=4.5, dilate_iters=2):
+    """
+    Detect a FIXED bad-pixel pattern -- a hot/flaky/trap pixel (or small
+    cluster) baked into the detector -- by running LACosmic (astroscrappy)
+    independently on EACH raw calibrated science frame, before any
+    alignment/resampling, and taking the union of what it flags across all
+    of them.
+
+    This exists because the sigma-clipped mean combine used to build the
+    final stack can only reject a pixel that's an outlier RELATIVE TO THE
+    OTHER FRAMES at that location. A detector defect that's present in every
+    frame identically (e.g. because the science frames weren't dithered)
+    looks exactly like a real, consistent source to that combine step, and
+    survives into the final stack untouched. Running LACosmic per-frame
+    instead catches it by SHAPE (sharp/blocky, unlike a real star's smooth
+    PSF falloff), not by amplitude or cross-frame consistency, so it works
+    even though every single frame has the exact same defect.
+
+    Returns (dilated_mask, n_before) -- a single boolean mask (same shape as
+    the frames) dilated by `dilate_iters` to also cover a few pixels of
+    sub-pixel drift introduced by the alignment step that follows, plus the
+    pixel count BEFORE dilation. Callers should sanity-check `n_before` (or
+    its fraction of the frame) rather than the dilated count: dilation can
+    inflate even a handful of genuinely-bad pixels by an order of magnitude
+    or more, so it's a poor signal for "did detection go haywire."
+    """
+    gain, readnoise = get_gain_readnoise(header, gain_arg, readnoise_arg)
+    print(f"bad-pixel mask: running LACosmic on {len(calibrated_frames)} raw "
+          f"calibrated frame(s) (gain={gain:.2f} e-/ADU, readnoise={readnoise:.2f} ADU, "
+          f"sigclip={sigclip})...")
+    combined_mask = None
+    for i, frame in enumerate(calibrated_frames, start=1):
+        # astroscrappy expects a finite array; the overscan/gap columns are
+        # already NaN at this point (real non-data, excluded elsewhere), so
+        # fill them with the frame's own median for detection purposes only
+        # -- this doesn't add them to the returned mask (they're not local
+        # outliers relative to that fill value) and doesn't shift alignment
+        # between the mask and the original array.
+        safe_frame = np.where(np.isfinite(frame), frame, np.nanmedian(frame))
+        mask, _ = astroscrappy.detect_cosmics(
+            safe_frame, gain=gain, readnoise=readnoise,
+            sigclip=sigclip, sigfrac=0.3, objlim=5.0, niter=4,
+        )
+        print(f"  frame {i}/{len(calibrated_frames)}: {int(mask.sum())} pixel(s) flagged")
+        combined_mask = mask if combined_mask is None else (combined_mask | mask)
+
+    n_before = int(combined_mask.sum())
+    if dilate_iters > 0:
+        combined_mask = binary_dilation(combined_mask, iterations=dilate_iters)
+    print(f"bad-pixel mask: {n_before} pixel(s) flagged bad in at least one frame; "
+          f"{int(combined_mask.sum())} pixel(s) after {dilate_iters}-iteration dilation")
+    return combined_mask, n_before
 
 
 def integer_shift_align(ref, img):
@@ -470,6 +618,7 @@ def main():
 
     # -- Calibrate science frames ---------------------------------------- #
     calibrated = []
+    frame_headers = []
     ref_header = None
     exptimes = set()
     for f in science_files:
@@ -485,15 +634,10 @@ def main():
         if master_flat is not None:
             frame = frame / master_flat
         calibrated.append(frame)
+        frame_headers.append(hdr)
         exptimes.add(exptime)
         if ref_header is None:
             ref_header = hdr
-        if args.save_calibrated_frames:
-            out_name = os.path.splitext(os.path.basename(f))[0] + "_calibrated.fits"
-            safe_writeto(
-                fits.PrimaryHDU(data=calibrated[-1], header=hdr),
-                os.path.join(args.output_dir, out_name),
-            )
 
     if len(exptimes) > 1:
         warnings.warn(f"Science frames have differing EXPTIME values: {exptimes}. "
@@ -501,6 +645,83 @@ def main():
                        "still assumes matched exposure times/throughput.")
     else:
         print(f"all science frames share EXPTIME = {exptimes.pop()} s")
+
+    # -- Detect + mask a fixed bad-pixel pattern (before alignment) ------- #
+    # See step 4.5 in the module docstring / build_bad_pixel_mask() for why
+    # this has to happen here, pre-alignment, rather than on the final stack.
+    #
+    # IMPORTANT: LACosmic assumes the input is already flat-fielded -- its
+    # noise model only accounts for Poisson (shot) + read noise, not ordinary
+    # pixel-to-pixel QE variation, which a flat-field division normally
+    # removes. Skip flat-fielding (as here whenever master_flat is None) and
+    # that un-corrected few-percent QE texture reads as "sharp" structure
+    # against the (now too-optimistic) noise model, causing widespread false
+    # positives -- confirmed with a synthetic test: ~9% of pixels falsely
+    # flagged on realistic bright-sky data without a flat, vs. 0.02% (just
+    # the real defect) with the same data flat-fielded. So this step is
+    # SKIPPED BY DEFAULT whenever there's no master flat, unless
+    # --force-bad-pixel-mask is passed explicitly.
+    bad_pixel_mask = None
+    if args.no_bad_pixel_mask:
+        print("--no-bad-pixel-mask set -- skipping automatic bad-pixel detection")
+    elif master_flat is None and not args.force_bad_pixel_mask:
+        warnings.warn(
+            "No flat-fielding was applied (see the flat-field step above) -- skipping "
+            "automatic bad-pixel-mask detection. LACosmic assumes flat-fielded input; "
+            "without it, ordinary pixel-to-pixel QE variation gets misread as defects "
+            "and can flag a large fraction of the frame (a 'grainy' look). Rerun with "
+            "--flat-root once you have z'-band flats, or pass --force-bad-pixel-mask "
+            "to run it anyway (not recommended without a flat -- expect false positives)."
+        )
+    elif not HAVE_ASTROSCRAPPY:
+        warnings.warn("astroscrappy not installed -- skipping automatic bad-pixel-mask "
+                       "detection (`pip install astroscrappy` to enable it). A fixed "
+                       "detector defect that's identical in every science frame (e.g. "
+                       "because they weren't dithered) will NOT be caught by the "
+                       "sigma-clipped combine below and may survive into the stack.")
+    else:
+        if master_flat is None:
+            warnings.warn("--force-bad-pixel-mask set with no flat-fielding -- expect "
+                           "some false positives from un-corrected pixel-to-pixel QE "
+                           "variation being misread as defects.")
+        bad_pixel_mask, n_before_dilation = build_bad_pixel_mask(
+            calibrated, ref_header, args.gain, args.readnoise,
+            sigclip=args.bpm_sigclip, dilate_iters=args.bpm_dilate,
+        )
+        # Sanity-check on the PRE-dilation count/fraction, not the dilated
+        # one -- dilation can inflate even a handful of genuinely-bad pixels
+        # by an order of magnitude or more, which would otherwise trip this
+        # check on perfectly legitimate detections.
+        frac_before_dilation = n_before_dilation / bad_pixel_mask.size
+        if frac_before_dilation > 0.01:
+            n_flagged = int(bad_pixel_mask.sum())
+            warnings.warn(
+                f"bad-pixel mask flagged {n_before_dilation} pixel(s) "
+                f"({100*frac_before_dilation:.1f}% of the frame, before dilation) -- "
+                "that's far more than a real fixed-defect count and likely means the "
+                "noise model doesn't match this data (check --gain/--readnoise against "
+                "your real header values, or flat-fielding may be missing/insufficient). "
+                "NOT applying this mask automatically -- rerun with --bpm-sigclip raised "
+                "well above the default, or fix flat-fielding/gain/readnoise, and check "
+                "the pre-dilation count drops to a small number of pixels before trusting it."
+            )
+            bad_pixel_mask = None  # don't apply it, and don't claim we did in the HISTORY card
+        elif n_before_dilation:
+            n_flagged = int(bad_pixel_mask.sum())
+            print(f"masking {n_flagged} bad-pixel-mask pixel(s) to NaN "
+                  f"in all {len(calibrated)} calibrated science frame(s)")
+            for frame in calibrated:
+                frame[bad_pixel_mask] = np.nan
+        else:
+            print("bad-pixel mask: no consistently-bad pixels found")
+
+    if args.save_calibrated_frames:
+        for f, frame, hdr in zip(science_files, calibrated, frame_headers):
+            out_name = os.path.splitext(os.path.basename(f))[0] + "_calibrated.fits"
+            safe_writeto(
+                fits.PrimaryHDU(data=frame, header=hdr),
+                os.path.join(args.output_dir, out_name),
+            )
 
     # -- Align to the first frame --------------------------------------- #
     print("aligning frames..." + ("" if HAVE_ASTROALIGN
@@ -533,6 +754,23 @@ def main():
     if flat_files:
         out_hdr["HISTORY"] = "Flat-fielded (master flat from " + \
             ", ".join(os.path.basename(f) for f in flat_files) + ")"
+    if bad_pixel_mask is not None:
+        out_hdr["HISTORY"] = (
+            f"Fixed bad-pixel mask: {int(bad_pixel_mask.sum())} pixel(s) masked to NaN "
+            f"in every science frame pre-alignment (LACosmic via astroscrappy, "
+            f"sigclip={args.bpm_sigclip}, dilate={args.bpm_dilate} iter)"
+        )
+        out_hdr["BPMASKN"] = (int(bad_pixel_mask.sum()), "Bad-pixel-mask pixels masked pre-alignment")
+    elif args.no_bad_pixel_mask:
+        out_hdr["HISTORY"] = "Fixed bad-pixel-mask detection skipped (--no-bad-pixel-mask)"
+    elif master_flat is None and not args.force_bad_pixel_mask:
+        out_hdr["HISTORY"] = ("Fixed bad-pixel-mask detection skipped (no flat-fielding; "
+                               "LACosmic needs flat-fielded input -- see --force-bad-pixel-mask)")
+    elif not HAVE_ASTROSCRAPPY:
+        out_hdr["HISTORY"] = "Fixed bad-pixel-mask detection skipped (astroscrappy not installed)"
+    else:
+        out_hdr["HISTORY"] = ("Fixed bad-pixel-mask detection ran but flagged too large a "
+                               "fraction of the frame to trust -- NOT applied (see log)")
     out_hdr["HISTORY"] = f"Stacked from {len(science_files)} frames: " + \
         ", ".join(os.path.basename(f) for f in science_files)
     out_hdr["HISTORY"] = "Aligned via " + ("astroalign" if HAVE_ASTROALIGN
